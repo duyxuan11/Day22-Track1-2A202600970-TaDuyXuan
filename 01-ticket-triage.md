@@ -233,11 +233,15 @@ Sau khi đọc seed cases ở trên, hãy đề xuất thêm 5 case cần đưa 
 
 Không cần nộp một bảng coverage riêng. Hãy chọn 5 case đại diện cho các lát cắt khác nhau, ví dụ: match rõ, thiếu tín hiệu, ambiguity, escalation, và regression.
 
-1. Happy path:
-2. Ambiguous input:
-3. Missing information:
-4. High-risk / escalation:
-5. Regression case:
+1. Happy path: Ticket `"Billing issue — I was charged twice this month"` từ khách enterprise. Kỳ vọng: `category=billing`, `urgency=high`, `requires_human=true`, `route_to=billing_ops`. Case này bắt lỗi nếu AI phân loại nhầm sang `technical` hoặc không escalate dù nội dung đủ rõ.
+
+2. Ambiguous input: Ticket chỉ có tiêu đề `"Question"`, nội dung `"Hi can you help"`. Kỳ vọng: AI gán `category=clarification_needed`, `confidence` thấp (< 0.5), không tự chốn `urgency=high`. Case bắt lỗi hallucination — AI không được tự thêm urgency khi input không có đủ tín hiệu.
+
+3. Missing information: Ticket có subject rõ `"Cannot export PDF report"` nhưng không có `customer_tier` trong input. Kỳ vọng: AI vẫn gán được `category=technical` và `urgency=medium`, nhưng `requires_human` không thể trigger rule enterprise. Case bắt lỗi AI giả định tier khi field bị thiếu.
+
+4. High-risk / escalation: Ticket `"CRITICAL: our entire API is down and production orders are failing"` từ khách enterprise. Kỳ vọng: `urgency=critical`, `requires_human=true`, `route_to=human_escalation`. Case bắt lỗi nếu AI không nhận ra từ khoá production outage là P0.
+
+5. Regression case: Ticket từ T-002 mock outcome — "URGENT: payment failed and account disabled" từ enterprise, nhưng AI gán `category=product_question`, `urgency=medium`, `requires_human=false` như trong mock outcome ban đầu. Case này phải luôn fail trong eval suite để đảm bảo lỗi không tái phát sau khi đã sửa prompt.
 
 Với mỗi case, thêm 1 dòng ngắn giải thích:
 
@@ -329,7 +333,9 @@ Hãy viết 2-4 câu, trong đó có cả:
 - bạn chọn lát cắt nào,
 - và vì sao đây là đơn vị đủ nhỏ để eval.
 
-> ...
+> **Lát cắt được chọn:** Một ticket mới đi vào hệ thống → AI đọc tiêu đề, nội dung, loại khách → trả về bộ nhãn gồm: `category`, `urgency`, `route_to`, `requires_human`, `reason_codes`, `confidence`.
+>
+> Đây là đơn vị đủ nhỏ vì mỗi ticket là một quyết định độc lập, output rõ ràng, có thể so với golden label, và eval từng ticket xong là ra kết quả ngay — không phụ thuộc vào session trước hay trạng thái hệ thống ngoài. Nếu đơn vị lớn hơn (ví dụ toàn bộ hội thoại hỗ trợ), sẽ rất khó quy trách nhiệm lỗi về đúng bước. Nếu nhỏ hơn (ví dụ chỉ chấm `category` đơn lẻ), sẽ bỏ sót rủi ro liên kết giữa `urgency` và `requires_human`.
 
 ### 2. Quality Question
 
@@ -350,7 +356,9 @@ Hãy viết 2-4 câu, trong đó có cả:
 - câu hỏi chất lượng bạn chọn,
 - và vì sao nếu fail ở đây thì ticket sẽ đi sai hoặc gây mất trust.
 
-> ...
+> **Quality Question:** AI có gán đúng `route_to` và bật `requires_human = true` cho mọi ticket có dấu hiệu chặn công việc hoặc khách doanh nghiệp đang gặp sự cố nghiêm trọng không?
+>
+> Nếu AI fail ở đây, ticket sẽ rơi vào hàng xử lý sai team (ví dụ ticket billing vào product_team), hoặc tệ hơn là bị đánh `urgency = low` khi khách đang bị locked out. Điều này trực tiếp gây trễ SLA, ảnh hưởng doanh nghiệp khách hàng, và làm mất tin tưởng vào toàn bộ hệ thống triage. Bị sai ở route và escalation là lỗi P1 — không phải lỗi giao diện hay style.
 
 ### 3. Output Contract tối thiểu
 
@@ -370,7 +378,15 @@ Mẹo lấy từ ví dụ full luồng:
 
 Đừng chỉ liệt kê field. Với mỗi field bạn giữ lại, hãy giải thích ngắn vì sao nó cần cho UI, routing, escalation, hoặc eval.
 
-> ...
+> - `ticket_id` — khoá để trace kết quả eval về đúng ticket, bắt buộc trong mọi log.
+> - `category` (enum: `technical`, `billing`, `feature_request`, `clarification_needed`) — quyết định team nào nhận ticket; sai đây là P1.
+> - `urgency` (enum: `low`, `medium`, `high`, `critical`) — quyết định hàng đợi; với enterprise + dấu hiệu blocking, không được để `low`.
+> - `requires_human` (boolean) — trigger escalation flag trên UI và đẩy vào hàng ưu tiên cao; cần để eval kiểm tra business rule `enterprise + high/critical → true`.
+> - `route_to` (enum: `technical_support`, `billing_ops`, `product_team`, `human_escalation`) — gửi ticket đến đúng team; đây là output quyết định routing thật sự.
+> - `reason_codes` (array of strings) — giải thích ngắn tại sao AI chọn như vậy, dùng để LLM judge kiểm tra hallucination và human review kiểm tra logic.
+> - `confidence` (float 0–1) — dùng để route case xuống human review khi AI không chắc (confidence thấp = cần người xem lại).
+>
+> Các field không cần ở v0: timestamp (có ở metadata hệ thống), customer_name (không ảnh hưởng routing), internal notes (nguy cơ lộ data không cần thiết)..
 
 ### 4. Eval Decision Map
 
@@ -384,12 +400,15 @@ Mẹo lấy từ ví dụ full luồng:
 
 | Thành phần cần chấm | Code | LLM | Human | Expert | Lý do |
 | --- | ---: | ---: | ---: | ---: | --- |
-|  |  |  |  |  |  |
-|  |  |  |  |  |  |
-|  |  |  |  |  |  |
-|  |  |  |  |  |  |
-|  |  |  |  |  |  |
-|  |  |  |  |  |  |
+| Schema / enum hợp lệ | ✓ | | | | Deterministic — có thể kiểm tra bằng validator; sai là vỡ hệ thống ngay |
+| Business rule: enterprise + high/critical → requires_human | ✓ | | | | Rule rõ ràng, không cần đọc ngữ nghĩa, code bắt chắc hơn LLM |
+| Routing đúng category (billing ≠ product_team) | ✓ | | | | Rule cứng từ policy; có thể viết assertion theo bảng category→route |
+| confidence nằm trong [0, 1] | ✓ | | | | Numeric bound, code kiểm tra trong 1 dòng |
+| category phù hợp nội dung ticket | | ✓ | | | Cần đọc hiểu ngữ nghĩa để phân loại đúng — code không bắt tốt khi input mơ hồ |
+| reason_codes phản ánh đúng nội dung (không hallucinate) | | ✓ | | | Cần LLM so sánh claim trong reason với nội dung ticket gốc |
+| urgency hợp lý với mức độ nghiêm trọng | | ✓ | | | "blocking work" hay "account disabled" cần đọc hiểu mới biết đủ để `high/critical` |
+| Sample lỗi P1 từ enterprise customer | | | ✓ | | Nhân viên vận hành cần xem lại case có impact cao để xác nhận human gate hoạt động đúng |
+| Taxonomy category và routing policy | | | | ✗ | Không cần domain expert — policy do team ops nội bộ định nghĩa, không cần chuyên môn bên ngoài |
 
 Bạn có thể thêm hoặc bớt dòng nếu cần, nhưng không nên biến bảng này thành một danh sách rất dài.
 
@@ -408,6 +427,35 @@ Mỗi ý nên viết theo dạng:
 - Kiểm tra: [rule]
   Vì sao nên giao cho code:
 
+---
+
+- Kiểm tra: Output có đúng JSON schema không — tất cả field bắt buộc (`ticket_id`, `category`, `urgency`, `requires_human`, `route_to`, `reason_codes`, `confidence`) đều phải có mặt và đúng kiểu dữ liệu.
+  Vì sao nên giao cho code: Đây là invariant kỹ thuật — nếu output sai schema, toàn bộ hệ thống downstream vỡ. Code validate schema trong 1 hàm, chạy mọi case, không tốn thêm chi phí.
+
+- Kiểm tra: `category` phải thuộc enum `{technical, billing, feature_request, clarification_needed}`.
+  Vì sao nên giao cho code: Tập cho phép cố định, không cần đọc ngữ nghĩa để biết "product_question" là sai enum.
+
+- Kiểm tra: `urgency` phải thuộc enum `{low, medium, high, critical}`.
+  Vì sao nên giao cho code: Như trên — giá trị ngoài enum báo ngay lỗi format.
+
+- Kiểm tra: `confidence` phải là số trong khoảng `[0.0, 1.0]`.
+  Vì sao nên giao cho code: Bound numeric, assert 1 dòng.
+
+- Kiểm tra: Nếu `customer_tier = enterprise` và `urgency` là `high` hoặc `critical`, thì `requires_human` phải bằng `true`.
+  Vì sao nên giao cho code: Business rule tường minh, có thể viết thành `if enterprise AND urgency in {high, critical}: assert requires_human == true`.
+
+- Kiểm tra: Ticket có `category = billing` không được có `route_to = product_team`.
+  Vì sao nên giao cho code: Policy cứng — bảng mapping category→allowed_routes có thể hardcode và assert.
+
+- Kiểm tra: Nếu nội dung ticket chứa các từ khoá `blocking`, `locked out`, `account disabled`, `cannot login`, thì `urgency` không được là `low`.
+  Vì sao nên giao cho code: Có thể dùng keyword matching — đây là safety net bắt lỗi thô nhất trước khi LLM judge chạy semantic.
+
+- Kiểm tra: `reason_codes` không được là mảng rỗng khi `requires_human = true`.
+  Vì sao nên giao cho code: Invariant — nếu AI đánh cờ escalation mà không có reason, hệ thống không có gì để nhân viên đọc; rule đơn giản, assert được.
+
+- Kiểm tra: Mock outcome T-002 — `category = "Product question"` và `urgency = "Medium"` và `requires_human = false` → phải bị flag là fail theo business rule.
+  Vì sao nên giao cho code: Regression test cụ thể; lưu case này vào reference dataset để bắt nếu sau này AI "học lại" sai.
+
 ### 6. Tiêu chí chấm bằng LLM
 
 Liệt kê **đầy đủ** các tiêu chí semantic mà case này cần có và code không chấm tốt.
@@ -421,6 +469,23 @@ Mỗi ý nên viết theo dạng:
 - Tiêu chí: [criterion]
   Vì sao code không bắt tốt:
 
+---
+
+- Tiêu chí: `category` có phù hợp với nội dung thật của ticket không — ví dụ ticket nói "payment failed" nhưng AI gán `feature_request`.
+  Vì sao code không bắt tốt: Code chỉ kiểm tra được enum hợp lệ, không đọc được ngữ nghĩa. Việc phân loại đúng cần hiểu ý định của khách, không chỉ kiểm tra format.
+
+- Tiêu chí: `urgency` có khớp với mức độ nghiêm trọng thực sự trong ticket không — ví dụ khách nói "blocking my work" nhưng AI vẫn gán `medium`.
+  Vì sao code không bắt tốt: Keyword matching bắt được từ khoá rõ như "locked out", nhưng không bắt được cách diễn đạt gián tiếp như "chúng tôi không làm việc được từ sáng".
+
+- Tiêu chí: `reason_codes` có phản ánh đúng nội dung ticket không — AI không được bịa thêm sự thật không có trong input.
+  Vì sao code không bắt tốt: Code không thể so sánh ngữ nghĩa giữa claim trong `reason_codes` và nội dung ticket gốc — cần LLM đọc cả hai và đánh giá xem có hallucination không.
+
+- Tiêu chí: Với ticket mơ hồ (Seed B: "Help / Please help asap"), AI có đúng đắn không tự tin gán category mà để `clarification_needed` hoặc `confidence` thấp không?
+  Vì sao code không bắt tốt: Code biết confidence thấp nhưng không biết "confidence thấp ở đây có phải vì thiếu thông tin hay vì model đang đoán mò" — LLM judge đọc cả ticket và output mới phán xét được.
+
+- Tiêu chí: Toàn bộ output có nhất quán không — ví dụ `requires_human = false` nhưng `urgency = critical` là mâu thuẫn nội tại.
+  Vì sao code không bắt tốt: Rule cứng bắt được một số combination, nhưng mâu thuẫn ngữ nghĩa tinh vi hơn (ví dụ reason mô tả mức high nhưng urgency trả về low) cần LLM đọc tổng thể.
+
 ### 7. Human / Expert Review
 
 - Ai cần review?
@@ -431,7 +496,15 @@ Mỗi ý nên viết theo dạng:
 
 Đừng chỉ ghi tên team review. Hãy giải thích vì sao đúng nhóm người đó cần xem, và failure nào cần họ xem.
 
-> ...
+> **Ai review:** Nhân viên vận hành support (team lead hoặc senior agent) — không phải domain expert chuyên môn bên ngoài.
+>
+> **Review những case nào:**
+> - Các ticket từ `enterprise` customer có `urgency = high/critical` để xác nhận AI escalate đúng.
+> - Các case LLM judge cho điểm thấp hoặc conflict với code check (ví dụ code pass nhưng LLM judge flag).
+> - Mẫu random 5–10% ticket trong tuần đầu pilot để ước lượng chất lượng tổng thể.
+> - Bất kỳ case nào `confidence < 0.6` — AI không chắc thì người cần xem lại.
+>
+> **Vì sao không cần domain expert:** Case này là SaaS support triage thông thường — category và routing policy do team nội bộ định nghĩa, không liên quan đến pháp lý, y tế, hay tài chính. Nhân viên vận hành support đủ năng lực xác nhận "ticket này có đi đúng hàng không" mà không cần chuyên gia bên ngoài.
 
 Nếu chọn **có domain expert**, bạn phải làm thêm 2 phần dưới đây. Nếu **không cần domain expert**, hãy ghi `Không áp dụng` và giải thích 1 câu.
 
@@ -447,17 +520,31 @@ Expert cần thấy tối thiểu:
 
 **Trả lời của bạn:**
 
-```text
-...
-```
+`Không áp dụng` — Policy triage là do team vận hành nội bộ xác định, không cần chuyên gia y tế, pháp lý hay tài chính. Senior support agent đủ thẩm quyền duyệt edge case và xác nhận routing taxonomy.
 
 #### 7B. Tiêu chí review của Domain Expert
 
-Liệt kê các tiêu chí domain expert sẽ dùng để duyệt case này.
+`Không áp dụng` — xem lý do ở 7A.
 
 ### 8. Release Gate
 
 Đề xuất release gate phù hợp cho case này. Nêu rõ điều kiện chặn, ngưỡng chất lượng tối thiểu, và trường hợp cần human review.
+
+**Điều kiện chặn (block nếu vi phạm bất kỳ điều nào):**
+- Schema pass rate < 99.5% — output vỡ schema là lỗi hệ thống, không thể ship.
+- Business rule violations > 0 — ví dụ: enterprise + critical mà `requires_human = false`, hoặc billing route vào product_team.
+- Escalation recall (bắt đúng ticket cần người) < 95% — miss escalation là P1, tỷ lệ này phải cao.
+- Category accuracy trên reference dataset < 88% — routing sai quá nhiều thì vận hành không tin tưởng hệ thống.
+- Bất kỳ P0 nào: hallucination trong reason_codes (bịa thêm thông tin không có trong ticket), lộ internal ID.
+
+**Ngưỡng cảnh báo (warn, không chặn):**
+- Confidence trung bình < 0.70 → tăng tỷ lệ human review tạm thời.
+- LLM judge và code check disagree > 10% cases → cần audit rubric.
+- Latency P95 > 3 giây → cần xem lại prompt hoặc model.
+
+**Trường hợp bắt buộc human review trước ship:**
+- Sample 20 case enterprise + high/critical từ eval run, đủ điều kiện mới release.
+- Nếu có bất kỳ failure mode mới nào chưa có trong taxonomy → chặn, thêm case vào dataset, chạy lại.
 
 ### 9. Kế hoạch chạy thử và dự toán chi phí
 
@@ -496,5 +583,32 @@ Sau phần này, viết thêm 2-4 câu ngắn:
 - bạn dùng giá API thật từ đâu để tính,
 - với quy mô này chi phí tổng rơi vào khoảng nào,
 - và vì sao plan này đủ để chứng minh case có thể pilot được.
+
+---
+
+**Kế hoạch chạy thử:**
+
+- **Model sử dụng:** Claude Haiku 4.5 cho triage chính (rẻ, nhanh), Claude Sonnet 4.6 làm LLM judge.
+- **Giá API tham khảo (tháng 6/2026):**
+  - Haiku 4.5: ~$0.80/1M input tokens, ~$4/1M output tokens
+  - Sonnet 4.6 (judge): ~$3/1M input tokens, ~$15/1M output tokens
+- **Cases pilot:** 75 cases (mix: ~30 happy path, ~20 ambiguous, ~15 escalation, ~10 regression).
+- **Số lần chạy:** 40 lần (bao gồm 2–3 vòng prompt iteration, mỗi vòng chạy full 75 cases).
+
+**Ước tính token:**
+- Mỗi triage call: ~500 input + ~200 output tokens → $0.0005/call
+- 75 cases × 40 runs = 3,000 calls → ~$1.50 (Haiku triage)
+- LLM judge: mỗi call ~1,000 input + ~300 output → $0.008/call; chạy 50% cases = 1,500 calls → ~$12 (Sonnet judge)
+- **Tổng chi phí API: ~$14**
+
+**Giờ công:**
+- PM / thiết kế eval: 6 giờ (viết rubric, lên dataset, xác nhận release gate)
+- Kỹ thuật / chạy eval: 8 giờ (viết code assertions, eval runner, phân tích kết quả)
+- Human review (nhân viên ops): 4 giờ (duyệt 20 case enterprise escalation + sample random)
+- **Tổng nhân công: ~18 giờ**
+
+**Tổng thời gian dự kiến:** 1 tuần (song song)
+
+Giá API lấy từ trang pricing chính thức của Anthropic (anthropic.com/pricing). Với quy mô 75 cases và 40 lần chạy, tổng chi phí rơi vào khoảng **$14–20 tuỳ mức prompt dài ngắn**. Plan này đủ để chứng minh: schema pass rate, escalation recall, và category accuracy có thể đạt ngưỡng release gate — tức là đủ để đề xuất pilot thật với nhân viên ops.
 
 ---
